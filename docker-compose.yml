@@ -1,0 +1,143 @@
+name: enem-lakehouse
+
+networks:
+  enem-lakehouse-net:
+    name: enem-lakehouse-net
+    driver: bridge
+
+volumes:
+  enem-postgres-data:
+    name: enem-postgres-data
+  enem-minio-data:
+    name: enem-minio-data
+
+services:
+  enem-postgres:
+    image: postgres:15-alpine
+    container_name: enem-postgres
+    hostname: enem-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-enem_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-enem_admin_pass}
+      POSTGRES_DB: ${POSTGRES_DB:-metastore}
+    ports:
+      - "5432:5432"
+    volumes:
+      - enem-postgres-data:/var/lib/postgresql/data
+      - ./docker/postgres/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
+    networks:
+      - enem-lakehouse-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-enem_admin} -d ${POSTGRES_DB:-metastore}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  enem-minio:
+    image: cgr.dev/chainguard/minio:latest
+    container_name: enem-minio
+    hostname: enem-minio
+    restart: unless-stopped
+    user: "0:0"
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-enem_minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-enem_minio_pass}
+    ports:
+      - "${MINIO_API_PORT:-19000}:9000"
+      - "${MINIO_CONSOLE_PORT:-19001}:9001"
+    volumes:
+      - enem-minio-data:/data
+    networks:
+      - enem-lakehouse-net
+
+  enem-minio-init:
+    build:
+      context: ./docker/minio-init
+    image: enem-minio-init:latest
+    container_name: enem-minio-init
+    depends_on:
+      - enem-minio
+    environment:
+      MINIO_ENDPOINT: enem-minio:9000
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-enem_minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-enem_minio_pass}
+    networks:
+      - enem-lakehouse-net
+
+  enem-hive-metastore:
+    build:
+      context: ./docker/hive-metastore
+    image: enem-hive-metastore:4.0.0
+    container_name: enem-hive-metastore
+    hostname: enem-hive-metastore
+    restart: unless-stopped
+    depends_on:
+      enem-postgres:
+        condition: service_healthy
+      enem-minio-init:
+        condition: service_completed_successfully
+    environment:
+      SERVICE_NAME: metastore
+      DB_DRIVER: postgres
+    ports:
+      - "${HIVE_METASTORE_PORT:-9083}:9083"
+    volumes:
+      - ./docker/hive-metastore/conf/metastore-site.xml:/opt/hive/conf/metastore-site.xml:ro
+    networks:
+      - enem-lakehouse-net
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/9083'"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 25s
+
+  enem-spark-master:
+    build:
+      context: ./docker/spark
+    image: enem-spark:3.5.3
+    container_name: enem-spark-master
+    hostname: enem-spark-master
+    restart: unless-stopped
+    depends_on:
+      enem-hive-metastore:
+        condition: service_healthy
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+    environment:
+      SPARK_NO_DAEMONIZE: "true"
+      SPARK_MASTER_HOST: enem-spark-master
+      SPARK_MASTER_PORT: 7077
+      SPARK_MASTER_WEBUI_PORT: 8080
+    ports:
+      - "7077:7077"
+      - "${SPARK_MASTER_UI_PORT:-8080}:8080"
+    volumes:
+      - ./docker/spark/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+      - ./src:/opt/enem/src
+    networks:
+      - enem-lakehouse-net
+
+  enem-spark-worker:
+    build:
+      context: ./docker/spark
+    image: enem-spark:3.5.3
+    container_name: enem-spark-worker
+    hostname: enem-spark-worker
+    restart: unless-stopped
+    depends_on:
+      - enem-spark-master
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://enem-spark-master:7077
+    environment:
+      SPARK_NO_DAEMONIZE: "true"
+      SPARK_WORKER_CORES: 2
+      SPARK_WORKER_MEMORY: 2g
+      SPARK_WORKER_WEBUI_PORT: 8081
+    ports:
+      - "${SPARK_WORKER_UI_PORT:-8081}:8081"
+    volumes:
+      - ./docker/spark/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+      - ./src:/opt/enem/src
+    networks:
+      - enem-lakehouse-net
