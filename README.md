@@ -20,35 +20,35 @@ Projetar e implementar um pipeline automatizado de Big Data, em arquitetura **La
 
 ```mermaid
 flowchart LR
-    AF["Apache Airflow (Orquestracao)"] -.-> ING & SPK & ML
+    AF["Apache Airflow (Standalone)"] -.-> ING & SPK & ML
 
     INEP["ENEM 2020-2023"] --> ING["Ingestao (Python)"]
     ING --> BRZ["MinIO: Bronze"]
     BRZ --> SPK["PySpark (Limpeza e Harmonizacao)"]
-    SPK --> SLV["MinIO: Silver"]
-    SLV --> SQL["Spark SQL (Agregacoes)"] --> GLD["MinIO: Gold"]
+    SPK --> SLV["Apache Iceberg + MinIO: Silver"]
+    SLV --> SQL["Spark SQL (Agregacoes)"] --> GLD["Apache Iceberg + MinIO: Gold"]
     SLV --> ML["Spark MLlib (Predicao)"] --> GLD
     GLD --> ST["Dashboard (Streamlit)"]
 
-    HIVE["Hive Metastore"] <--> SLV & GLD
+    PG["PostgreSQL (Iceberg JDBC Catalog)"] <--> SLV & GLD
 ```
 
 ### Camadas e Ferramentas
 
 | Camada | Ferramenta | Papel na Arquitetura |
 | :--- | :--- | :--- |
-| **Orquestração** | Apache Airflow | Dispara e gerencia a DAG ponta a ponta (dependências, *retries* e logs). |
+| **Orquestração** | Apache Airflow (Standalone) | Dispara e gerencia a DAG ponta a ponta em um único container leve (dependências, *retries* e logs). |
 | **Ingestão** | Python (`requests` / `zipfile`) | Automatiza download e extração dos pacotes anuais do INEP para a camada **Bronze**. |
-| **Armazenamento** | MinIO (S3 local) + Parquet/Delta | Organiza os dados nas camadas *Bronze* (bruto), *Silver* (limpo/harmonizado) e *Gold* (agregações e resultados de ML), particionados por `NU_ANO`. |
-| **Catálogo** | Hive Metastore (+ PostgreSQL) | Expõe os arquivos Parquet/Delta do MinIO como tabelas SQL estruturadas (`enem_silver.*`, `enem_gold.*`). |
+| **Armazenamento e Tabelas** | MinIO (S3 local) + **Apache Iceberg** | Organiza os dados nas camadas *Bronze* (bruto), *Silver* (limpo/harmonizado) e *Gold* (agregações e resultados de ML), com tabelas Iceberg (ACID, *snapshots/time travel* e particionamento por `NU_ANO`). |
+| **Catálogo** | Iceberg JDBC Catalog (PostgreSQL) | Gerencia os metadados e ponteiros das tabelas Iceberg (`iceberg.enem_silver.*`, `iceberg.enem_gold.*`) diretamente no PostgreSQL, dispensando Hive Metastore. |
 | **Processamento e ML** | Apache Spark (`PySpark`, `Spark SQL`, `MLlib`) | Limpa e harmoniza categorias entre edições, gera agregações analíticas e treina o modelo preditivo de risco de abstenção. |
 | **Consumo** | Streamlit | Painel interativo conectado à camada **Gold** para visualização dos indicadores 2020–2023 e fatores de risco. |
 
 ### Fluxo Passo a Passo
 
 1. **Ingestão (`Bronze`):** O Airflow dispara a coleta dos CSVs oficiais do INEP e armazena os arquivos brutos sem alterações no bucket `bronze` do MinIO.
-2. **Limpeza e Harmonização (`Silver`):** Um job PySpark lê os CSVs da Bronze, trata tipos e encoding, harmoniza códigos que mudam entre edições (como `Q006` e `TP_ANO_CONCLUIU`), cria flags de abstenção e grava em Parquet/Delta na `silver`, registrando a tabela `enem_silver.participantes` no Hive Metastore.
-3. **Agregações Analíticas (`Gold`):** Um job Spark SQL consulta `enem_silver.participantes` e gera tabelas agregadas por UF, ano, renda, raça/cor, sexo e rede escolar.
+2. **Limpeza e Harmonização (`Silver`):** Um job PySpark lê os CSVs da Bronze, trata tipos e encoding, harmoniza códigos que mudam entre edições (como `Q006` e `TP_ANO_CONCLUIU`), cria flags de abstenção e grava a tabela Iceberg `iceberg.enem_silver.participantes` no MinIO com catálogo no PostgreSQL.
+3. **Agregações Analíticas (`Gold`):** Um job Spark SQL consulta `iceberg.enem_silver.participantes` e gera tabelas Iceberg agregadas por UF, ano, renda, raça/cor, sexo e rede escolar.
 4. **Modelagem Preditiva (`Gold`):** Um job Spark MLlib treina e avalia classificadores (validação temporal: treino em 2020–2022 e teste em 2023) usando apenas atributos anteriores à prova para prever o risco de ausência, salvando métricas e importância das variáveis na camada `gold`.
 5. **Consumo (`Streamlit`):** O dashboard lê as tabelas prontas da camada `gold` para exibição interativa.
 
